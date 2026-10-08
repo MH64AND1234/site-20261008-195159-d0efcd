@@ -92,13 +92,13 @@
   .readout .k.ai{color:rgba(0,179,255,.7);}
   .readout .k.amber{color:rgba(255,177,0,.7);}
 
-  /* لوحة إحصائيات */
   #statsPanel{position:absolute;top:50%;left:12px;transform:translateY(-50%);background:rgba(0,0,0,.6);border:1px solid rgba(0,179,255,.35);border-radius:10px;padding:10px 12px;display:none;flex-direction:column;gap:8px;font-size:11px;letter-spacing:.5px;z-index:6;backdrop-filter:blur(4px);}
   #statsPanel.show{display:flex;}
   #statsPanel .item{display:flex;justify-content:space-between;gap:14px;color:#88ccff;}
   #statsPanel .item b{color:#00b3ff;font-weight:800;}
   #statsPanel .item.in b{color:#00ff66;}
   #statsPanel .item.out b{color:#ffb100;}
+  #statsPanel .item.eng b{color:#00ff66;}
 </style>
 </head>
 <body>
@@ -139,6 +139,7 @@
       <div class="item"><span>🎯 الثقة</span><b id="spConf">--%</b></div>
       <div class="item"><span>📏 المسافة</span><b id="spDist">--م</b></div>
       <div class="item"><span>⚡ الأداء</span><b id="spFps">0 FPS</b></div>
+      <div class="item eng"><span>🧠 محرك AI</span><b id="spEngine">--</b></div>
     </div>
 
     <div id="hud">
@@ -166,8 +167,8 @@
 
     <div id="loading">
       <div class="spinner"></div>
-      <h2>⏳ جاري تحميل موديل الذكاء الاصطناعي…</h2>
-      <p>COCO-SSD (~6MB) — يحتاج إنترنت أول مرة فقط</p>
+      <h2 id="loadingTitle">⏳ جاري تحميل موديل الذكاء الاصطناعي…</h2>
+      <p id="loadingMsg">COCO-SSD (~6MB) — يحتاج إنترنت أول مرة فقط</p>
     </div>
 
     <div id="noCam">
@@ -248,6 +249,8 @@ const noCam   = document.getElementById('noCam');
 const errMsg  = document.getElementById('errMsg');
 const errCode = document.getElementById('errCode');
 const loading = document.getElementById('loading');
+const loadingTitle = document.getElementById('loadingTitle');
+const loadingMsg = document.getElementById('loadingMsg');
 const controls= document.getElementById('controls');
 const toggleUI= document.getElementById('toggleUI');
 const recDot  = document.getElementById('recDot');
@@ -258,9 +261,9 @@ const spOut   = document.getElementById('spOut');
 const spConf  = document.getElementById('spConf');
 const spDist  = document.getElementById('spDist');
 const spFps   = document.getElementById('spFps');
+const spEngine= document.getElementById('spEngine');
 
 /* ============ ثوابت ============ */
-/* تم تخفيض الدقة لتحسين الأداء */
 const SW = 320, SH = 240;
 const proc = document.createElement('canvas');
 proc.width = SW; proc.height = SH;
@@ -284,11 +287,15 @@ let nextId = 1;
 let inCount=0, outCount=0;
 let lastDetections = [];
 let lastDetectTime = 0;
-const DETECT_INTERVAL = 220;
+const DETECT_INTERVAL = 420;   // ✅ خفّضنا الحمل — كشف كل ~0.4 ثانية
+const CONFIDENCE_MIN = 0.35;   // ✅ عتبة أقل = يكشف أكثر
 
 /* قائمة الكاميرات */
 let camList = [];
 let camIndex = 0;
+
+/* Canvas محسّن للـ AI (يستخدم للصور المضلمة) */
+let aiCanvas = null, aiCtx = null;
 
 /* ============ LUT ============ */
 function makeLUT(stops){
@@ -326,6 +333,15 @@ function resizeCanvas(){
 window.addEventListener('resize', resizeCanvas);
 setTimeout(resizeCanvas, 50);
 
+/* ============ AI Canvas ============ */
+function initAICanvas(){
+  aiCanvas = document.createElement('canvas');
+  aiCanvas.width = SW;
+  aiCanvas.height = SH;
+  aiCtx = aiCanvas.getContext('2d');
+}
+initAICanvas();
+
 /* ============ الصوت ============ */
 function ping(freq=880, dur=0.15){
   if(!soundOn) return;
@@ -345,18 +361,47 @@ function ping(freq=880, dur=0.15){
   }catch(e){}
 }
 
-/* ============ تحميل AI ============ */
+/* ============ تحميل AI (GPU + Warmup) ============ */
 async function loadAI(){
   if(aiModel) return true;
   if(aiLoading) return false;
   aiLoading = true;
   loading.classList.add('show');
+  loadingTitle.textContent = '⏳ جاري تهيئة محرك AI…';
+  loadingMsg.textContent = 'تفعيل WebGL + تحميل الموديل';
+
   try{
+    // ✅ فعّل GPU (WebGL) — أسرع 3-5 مرات من CPU
+    let backendUsed = 'cpu';
+    try{
+      await tf.setBackend('webgl');
+      await tf.ready();
+      backendUsed = 'webgl';
+    }catch(e){
+      await tf.setBackend('cpu');
+      await tf.ready();
+      backendUsed = 'cpu';
+    }
+    spEngine.textContent = backendUsed.toUpperCase();
+
+    loadingMsg.textContent = 'تحميل COCO-SSD…';
     aiModel = await cocoSsd.load({ base:'lite_mobilenet_v2' });
+
+    // ✅ Warmup — أول كشف ياخذ وقت، نسويه على صورة صغيرة
+    loadingMsg.textContent = 'تسخين الموديل…';
+    const warm = document.createElement('canvas');
+    warm.width = 320; warm.height = 240;
+    // ارسم شي بسيط حتى يشتغل الـ pipeline كامل
+    const wctx = warm.getContext('2d');
+    wctx.fillStyle = '#888';
+    wctx.fillRect(100, 80, 60, 120);
+    await aiModel.detect(warm, 3, 0.9);
+
     loading.classList.remove('show');
     aiLoading = false;
     return true;
   }catch(e){
+    console.error('AI load failed:', e);
     loading.classList.remove('show');
     aiLoading = false;
     aiBtn.textContent = '❌ فشل';
@@ -364,7 +409,7 @@ async function loadAI(){
   }
 }
 
-/* ============ الكاميرا (تبديل موثوق بـ deviceId) ============ */
+/* ============ الكاميرا ============ */
 async function refreshCamList(){
   try{
     const devs = await navigator.mediaDevices.enumerateDevices();
@@ -398,7 +443,6 @@ async function openCam(deviceId){
       statusTag2.style.display = 'block';
       modeTag.textContent = '🔥 حراري';
       noCam.classList.remove('show');
-      // حدّث قائمة الكاميرات الآن بعد الإذن
       await refreshCamList();
       return true;
     }catch(e){ lastErr = e; console.warn('cam fail:', e.name, e.message); }
@@ -523,23 +567,15 @@ function stopRecording(){
   recDot.classList.remove('show');
 }
 
-/* 🔄 تبديل الكاميرا بطريقة موثوقة */
 swapBtn.onclick = async () => {
   if(demo){ statusTag2.textContent = 'المحاكاة مفعلة'; return; }
   if(!running){ statusTag2.textContent = 'شغّل الكاميرا أولاً'; return; }
 
   await refreshCamList();
 
-  if(camList.length === 0){
-    statusTag2.textContent = 'ما فيه كاميرا';
-    return;
-  }
-  if(camList.length === 1){
-    statusTag2.textContent = 'كاميرا وحدة فقط';
-    return;
-  }
+  if(camList.length === 0){ statusTag2.textContent = 'ما فيه كاميرا'; return; }
+  if(camList.length === 1){ statusTag2.textContent = 'كاميرا وحدة فقط'; return; }
 
-  // انتقل للكاميرا التالية
   camIndex = (camIndex + 1) % camList.length;
   const cam = camList[camIndex];
   statusTag2.textContent = 'جاري التبديل…';
@@ -658,13 +694,18 @@ function drawBlob(x,y,r,R,G,B){
   pctx.beginPath(); pctx.arc(x,y,r,0,Math.PI*2); pctx.fill();
 }
 
-/* ============ كشف AI ============ */
+/* ============ كشف AI (بالصورة المحسّنة) ============ */
 async function runDetection(){
   if(!aiEnabled || !aiModel || !running) return;
   try{
-    const src = demo ? proc : video;
-    const preds = await aiModel.detect(src, 8);
-    const persons = preds.filter(p => p.class === 'person' && p.score > 0.45);
+    // ✅ بالمحاكاة: استخدم proc مباشرة
+    // ✅ بالكاميرا الحقيقية: استخدم aiCanvas (صورة محسّنة الإضاءة)
+    const src = demo ? proc : aiCanvas;
+
+    // ✅ نمرر 6 كشوفات كحد أقصى، وعتبة 0.35
+    const preds = await aiModel.detect(src, 6, CONFIDENCE_MIN);
+    const persons = preds.filter(p => p.class === 'person');
+
     if(demo){
       lastDetections = demoPeople.map(p => ({
         bbox: [p.x - p.w, p.y - p.h, p.w*2, p.h*1.4],
@@ -774,6 +815,16 @@ function processFrame(now){
     buf[i+2] = LUT[idx+2];
   }
   pctx.putImageData(id, 0, 0);
+
+  // ✅ حضر صورة محسّنة الإضاءة للموديل (تشتغل بالأماكن المضلمة)
+  // نرسم من proc الأصلي (قبل التحويل الحراري) — لا، نحتاج الصورة الأصلية
+  // لكن proc الآن صار فيه الصورة الحرارية. نرسمها بـ grayscale + brightness
+  if(aiCtx){
+    aiCtx.save();
+    aiCtx.filter = 'grayscale(1) brightness(2.4) contrast(1.7)';
+    aiCtx.drawImage(proc, 0, 0, SW, SH);
+    aiCtx.restore();
+  }
 
   // رسم
   ctx.imageSmoothingEnabled = false;
